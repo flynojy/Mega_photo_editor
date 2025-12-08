@@ -20,6 +20,7 @@ import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
@@ -34,19 +35,21 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var hasLut: Boolean = false
     private var intensity: Float = 1.0f
 
-    // [核心修复] 初始化时补全第3个参数 (null)
     private var currentFilterItem: FilterItem = FilterItem("Original", null, null)
 
     private var brightness: Float = 0.0f
     private var contrast: Float = 1.0f
     private var saturation: Float = 1.0f
 
+    // 变换状态
     private var currentScale = 1.0f
     private var currentX = 0f
     private var currentY = 0f
     private var currentRotation = 0f
     private var isFlipped = false
     private val mvpMatrix = FloatArray(16)
+
+    private var tempScale = 1.0f
 
     private var currentCropRect = RectF(0f, 0f, 1f, 1f)
 
@@ -60,6 +63,9 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var viewWidth = 0
     private var viewHeight = 0
 
+    private var lastModelScaleX = 1f
+    private var lastModelScaleY = 1f
+
     private val vertexBuffer: FloatBuffer = ByteBuffer.allocateDirect(80)
         .order(ByteOrder.nativeOrder())
         .asFloatBuffer()
@@ -69,6 +75,12 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
         imageWidth = bitmap.width
         imageHeight = bitmap.height
         currentCropRect.set(0f, 0f, 1f, 1f)
+    }
+
+    fun setTempScale(scale: Float) {
+        runOnDraw.add(Runnable {
+            tempScale = scale
+        })
     }
 
     fun setCubeLut(data: CubeLutData?) {
@@ -97,12 +109,24 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     fun saveImage(callback: (Bitmap) -> Unit) {
+        runOnDraw.add(Runnable {
+            tempScale = 1.0f
+        })
         savePathCallback = callback
     }
 
+    // [核心修复] 极简变换更新：完全分离位移和缩放
+    // 缩放永远基于屏幕中心 (0,0) 进行
+    // 这样无论何时缩放，图片都是稳稳地变大变小，不会发生位移
     fun updateTransform(dx: Float, dy: Float, scaleFactor: Float) {
+        // 1. 更新缩放 (限制范围 0.5 - 10.0)
+        // 使用乘法累积缩放，实现相对缩放的效果
         currentScale *= scaleFactor
-        currentScale = currentScale.coerceIn(0.5f, 5.0f)
+        currentScale = currentScale.coerceIn(0.5f, 10.0f)
+
+        // 2. 更新平移
+        // 这里的 dx, dy 是屏幕上的位移增量，直接累加
+        // 只有单指拖动时 dx/dy 才有值，双指缩放时 dx/dy 为 0
         currentX += dx
         currentY += dy
     }
@@ -126,6 +150,17 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
     fun flipHorizontal() {
         runOnDraw.add(Runnable {
             isFlipped = !isFlipped
+        })
+    }
+
+    fun resetView() {
+        runOnDraw.add(Runnable {
+            currentScale = 1.0f
+            currentX = 0f
+            currentY = 0f
+            currentRotation = 0f
+            isFlipped = false
+            adjustAspectRatio()
         })
     }
 
@@ -166,7 +201,8 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
             Matrix.translateM(modelMatrix, 0, currentX, currentY, 0f)
             Matrix.rotateM(modelMatrix, 0, currentRotation, 0f, 0f, 1f)
             val flipScale = if (isFlipped) -1.0f else 1.0f
-            Matrix.scaleM(modelMatrix, 0, currentScale * flipScale, currentScale, 1.0f)
+            val finalScale = currentScale * tempScale
+            Matrix.scaleM(modelMatrix, 0, finalScale * flipScale, finalScale, 1.0f)
 
             val invertedMatrix = FloatArray(16)
             if (!Matrix.invertM(invertedMatrix, 0, modelMatrix, 0)) {
@@ -205,6 +241,8 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
             currentCropRect.set(finalMinU, finalMinV, finalMaxU, finalMaxV)
 
             currentScale = 1.0f; currentX = 0f; currentY = 0f; currentRotation = 0f; isFlipped = false
+            tempScale = 1.0f
+
             adjustAspectRatio()
 
             val newPixelW = (imageWidth * currentCropRect.width()).toInt()
@@ -253,14 +291,16 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
         val viewRatio = viewWidth.toFloat() / viewHeight
         var screenScaleX = 1f; var screenScaleY = 1f
         if (imgRatio > viewRatio) screenScaleY = viewRatio / imgRatio else screenScaleX = imgRatio / viewRatio
-        val modelScaleX = if (isRotated) screenScaleY else screenScaleX
-        val modelScaleY = if (isRotated) screenScaleX else screenScaleY
+
+        lastModelScaleX = if (isRotated) screenScaleY else screenScaleX
+        lastModelScaleY = if (isRotated) screenScaleX else screenScaleY
+
         val uL = currentCropRect.left; val uR = currentCropRect.right; val vT = currentCropRect.top; val vB = currentCropRect.bottom
         val vertexData = floatArrayOf(
-            -modelScaleX, -modelScaleY, 0f, uL, vB,
-            modelScaleX, -modelScaleY, 0f, uR, vB,
-            -modelScaleX,  modelScaleY, 0f, uL, vT,
-            modelScaleX,  modelScaleY, 0f, uR, vT
+            -lastModelScaleX, -lastModelScaleY, 0f, uL, vB,
+            lastModelScaleX, -lastModelScaleY, 0f, uR, vB,
+            -lastModelScaleX,  lastModelScaleY, 0f, uL, vT,
+            lastModelScaleX,  lastModelScaleY, 0f, uR, vT
         )
         vertexBuffer.clear(); vertexBuffer.put(vertexData); vertexBuffer.position(0)
     }
@@ -275,7 +315,8 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
         Matrix.translateM(mvpMatrix, 0, currentX, currentY, 0f)
         Matrix.rotateM(mvpMatrix, 0, currentRotation, 0f, 0f, 1f)
         val flipScale = if (isFlipped) -1.0f else 1.0f
-        Matrix.scaleM(mvpMatrix, 0, currentScale * flipScale, currentScale, 1.0f)
+        val finalScale = currentScale * tempScale
+        Matrix.scaleM(mvpMatrix, 0, finalScale * flipScale, finalScale, 1.0f)
 
         val uMVPMatrixHandle = GLES30.glGetUniformLocation(programId, "uMVPMatrix")
         GLES30.glUniformMatrix4fv(uMVPMatrixHandle, 1, false, mvpMatrix, 0)
@@ -296,7 +337,6 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
         GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(programId, "uLutTexture"), 1)
-
         if (hasLut) {
             GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, lut3DTextureId)
             GLES30.glUniform1i(GLES30.glGetUniformLocation(programId, "uHasLut"), 1)
@@ -313,8 +353,24 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
 
         savePathCallback?.let { callback ->
-            val bitmap = createBitmapFromGLSurface(0, 0, viewWidth, viewHeight)
-            callback(bitmap)
+            val (baseModelX, baseModelY) = calculateModelScale()
+            val contentScaleX = baseModelX * currentScale
+            val contentScaleY = baseModelY * currentScale
+            val contentW = contentScaleX * viewWidth * 2f
+            val contentH = contentScaleY * viewHeight * 2f
+            val centerX = (viewWidth / 2f) + (currentX / 2f * viewWidth)
+            val centerY = (viewHeight / 2f) - (currentY / 2f * viewHeight)
+            val x = (centerX - contentW / 2).roundToInt().coerceAtLeast(0)
+            val y = (centerY - contentH / 2).roundToInt().coerceAtLeast(0)
+            val w = contentW.roundToInt().coerceAtMost(viewWidth - x)
+            val h = contentH.roundToInt().coerceAtMost(viewHeight - y)
+            if (w > 0 && h > 0) {
+                val bitmap = createBitmapFromGLSurface(x, y, w, h)
+                callback(bitmap)
+            } else {
+                val bitmap = createBitmapFromGLSurface(0, 0, viewWidth, viewHeight)
+                callback(bitmap)
+            }
             savePathCallback = null
         }
     }
@@ -324,7 +380,8 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
         val bitmapSource = IntArray(w * h)
         val intBuffer = java.nio.IntBuffer.wrap(bitmapBuffer)
         intBuffer.position(0)
-        GLES30.glReadPixels(x, y, w, h, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, intBuffer)
+        val glY = viewHeight - (y + h)
+        GLES30.glReadPixels(x, glY, w, h, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, intBuffer)
         var offset1: Int; var offset2: Int
         for (i in 0 until h) {
             offset1 = i * w; offset2 = (h - i - 1) * w

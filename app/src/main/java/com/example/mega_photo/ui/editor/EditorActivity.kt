@@ -18,11 +18,13 @@ import com.example.mega_photo.data.FilterItem
 import com.example.mega_photo.databinding.ActivityEditorBinding
 import com.example.mega_photo.ui.adapter.FilterAdapter
 import com.example.mega_photo.utils.BitmapUtils
+import com.example.mega_photo.utils.CubeLutData
 import com.example.mega_photo.utils.CubeLutParser
 import com.example.mega_photo.utils.FileSaver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 
 class EditorActivity : AppCompatActivity() {
 
@@ -30,13 +32,18 @@ class EditorActivity : AppCompatActivity() {
     private lateinit var renderer: PhotoRenderer
     private lateinit var scaleGestureDetector: ScaleGestureDetector
 
-    // 状态管理器
     private val stateManager = StateManager(maxHistory = 10)
 
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     private var isScaling = false
     private var isCropMode = false
+
+    // [新增] 手指抬起标记
+    private var resetTouchAnchor = false
+
+    // [新增] 内存缓存 (Level 1 Cache)
+    private val lutCache = ConcurrentHashMap<String, CubeLutData>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -58,7 +65,6 @@ class EditorActivity : AppCompatActivity() {
             binding.glSurfaceView.renderMode = android.opengl.GLSurfaceView.RENDERMODE_WHEN_DIRTY
             binding.cropOverlayView.setImageDimensions(bitmap.width, bitmap.height)
 
-            // 初始化初始状态
             binding.glSurfaceView.post {
                 val initialState = renderer.getCurrentState()
                 stateManager.initialize(initialState)
@@ -76,7 +82,6 @@ class EditorActivity : AppCompatActivity() {
         binding.btnSave.setOnClickListener { showSaveDialog() }
     }
 
-    // [核心修复] 补充预览图参数
     private fun setupFilters() {
         val filters = listOf(
             FilterItem("Original", null, "lut_example/original.jpg"),
@@ -94,7 +99,66 @@ class EditorActivity : AppCompatActivity() {
         binding.rvFilters.adapter = FilterAdapter(filters) { filter ->
             applyFilter(filter)
         }
+
+        // [新增] 启动预加载 (在后台静默执行)
+        preloadAllFilters(filters)
     }
+
+    private fun preloadAllFilters(filters: List<FilterItem>) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            filters.forEach { item ->
+                val path = item.lutFileName
+                if (path != null && !lutCache.containsKey(path)) {
+                    // load 方法会自动处理二进制缓存
+                    val data = CubeLutParser.load(this@EditorActivity, path)
+                    if (data != null) {
+                        lutCache[path] = data
+                    }
+                }
+            }
+        }
+    }
+
+    private fun applyFilter(filter: FilterItem, saveState: Boolean = true) {
+        renderer.updateFilterRecord(filter)
+
+        if (filter.lutFileName == null) {
+            renderer.setCubeLut(null)
+            binding.glSurfaceView.requestRender()
+            if (saveState) saveCurrentState()
+        } else {
+            val fileName = filter.lutFileName
+
+            // 1. 查内存缓存
+            if (lutCache.containsKey(fileName)) {
+                renderer.setCubeLut(lutCache[fileName])
+                binding.glSurfaceView.requestRender()
+                if (saveState) saveCurrentState()
+            } else {
+                // 2. 内存未命中，异步加载 (会自动查磁盘缓存)
+                binding.progressBar.visibility = View.VISIBLE
+                lifecycleScope.launch(Dispatchers.IO) {
+                    val lutData = CubeLutParser.load(this@EditorActivity, fileName)
+                    if (lutData != null) {
+                        lutCache[fileName] = lutData
+                    }
+
+                    withContext(Dispatchers.Main) {
+                        binding.progressBar.visibility = View.GONE
+                        if (lutData != null) {
+                            renderer.setCubeLut(lutData)
+                            binding.glSurfaceView.requestRender()
+                            if (saveState) saveCurrentState()
+                        } else {
+                            Toast.makeText(this@EditorActivity, "LUT 解析失败", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- 以下方法保持原有逻辑，为完整性一并提供 ---
 
     private fun setupUndoRedo() {
         binding.btnUndo.setOnClickListener {
@@ -112,7 +176,6 @@ class EditorActivity : AppCompatActivity() {
     private fun updateUndoRedoButtons() {
         binding.btnUndo.isEnabled = stateManager.canUndo()
         binding.btnUndo.alpha = if (stateManager.canUndo()) 1.0f else 0.5f
-
         binding.btnRedo.isEnabled = stateManager.canRedo()
         binding.btnRedo.alpha = if (stateManager.canRedo()) 1.0f else 0.5f
     }
@@ -125,18 +188,23 @@ class EditorActivity : AppCompatActivity() {
 
     private fun applyState(state: EditorState) {
         renderer.restoreState(state)
-
         binding.seekBrightness.progress = ((state.brightness * 100) + 50).toInt()
         binding.seekContrast.progress = (state.contrast * 50).toInt()
         binding.seekSaturation.progress = (state.saturation * 50).toInt()
-
         applyFilter(state.filterItem, saveState = false)
         binding.glSurfaceView.requestRender()
     }
 
     private fun setupCropUI() {
         binding.btnCrop.setOnClickListener { enterCropMode() }
-        binding.btnCropCancel.setOnClickListener { exitCropMode() }
+
+        binding.btnCropCancel.setOnClickListener {
+            renderer.resetView()
+            renderer.setTempScale(1.0f)
+            binding.glSurfaceView.requestRender()
+            exitCropMode()
+        }
+
         binding.btnCropConfirm.setOnClickListener {
             val normalizedRect = binding.cropOverlayView.getNormalizedCropRect()
             renderer.applyCrop(normalizedRect) { newW, newH ->
@@ -145,11 +213,15 @@ class EditorActivity : AppCompatActivity() {
                     saveCurrentState()
                 }
             }
+            renderer.setTempScale(1.0f)
             exitCropMode()
         }
     }
 
     private fun enterCropMode() {
+        renderer.resetView()
+        renderer.setTempScale(0.8f)
+        binding.glSurfaceView.requestRender()
         isCropMode = true
         binding.cropOverlayView.visibility = View.VISIBLE
         binding.cropConfirmBar.visibility = View.VISIBLE
@@ -179,7 +251,6 @@ class EditorActivity : AppCompatActivity() {
                 updateRendererAdjustments()
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-
             override fun onStopTrackingTouch(seekBar: SeekBar?) {
                 saveCurrentState()
             }
@@ -188,17 +259,11 @@ class EditorActivity : AppCompatActivity() {
         binding.seekContrast.setOnSeekBarChangeListener(listener)
         binding.seekSaturation.setOnSeekBarChangeListener(listener)
 
-        // [新增] 重置调色
         binding.btnResetAdjust.setOnClickListener {
-            // 1. 重置 UI (fromUser = false，不会触发 listener 中的 update)
             binding.seekBrightness.progress = 50
             binding.seekContrast.progress = 50
             binding.seekSaturation.progress = 50
-
-            // 2. 手动应用重置后的参数
             updateRendererAdjustments()
-
-            // 3. 保存状态
             saveCurrentState()
         }
     }
@@ -260,6 +325,7 @@ class EditorActivity : AppCompatActivity() {
             }
             override fun onScaleEnd(detector: ScaleGestureDetector) {
                 isScaling = false
+                resetTouchAnchor = true
                 saveCurrentState()
             }
         })
@@ -277,9 +343,19 @@ class EditorActivity : AppCompatActivity() {
             MotionEvent.ACTION_DOWN -> {
                 lastTouchX = event.x
                 lastTouchY = event.y
+                resetTouchAnchor = false
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                resetTouchAnchor = true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (!isScaling && event.pointerCount == 1) {
+                if (!isScaling && !scaleGestureDetector.isInProgress && event.pointerCount == 1) {
+                    if (resetTouchAnchor) {
+                        lastTouchX = event.x
+                        lastTouchY = event.y
+                        resetTouchAnchor = false
+                        return
+                    }
                     val dx = event.x - lastTouchX
                     val dy = event.y - lastTouchY
                     val glDx = (dx / binding.glSurfaceView.width) * 2.0f
@@ -290,33 +366,9 @@ class EditorActivity : AppCompatActivity() {
                 lastTouchX = event.x
                 lastTouchY = event.y
             }
-            MotionEvent.ACTION_UP -> {
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (!isScaling) saveCurrentState()
-            }
-        }
-    }
-
-    private fun applyFilter(filter: FilterItem, saveState: Boolean = true) {
-        renderer.updateFilterRecord(filter)
-
-        if (filter.lutFileName == null) {
-            renderer.setCubeLut(null)
-            binding.glSurfaceView.requestRender()
-            if (saveState) saveCurrentState()
-        } else {
-            binding.progressBar.visibility = View.VISIBLE
-            lifecycleScope.launch(Dispatchers.IO) {
-                val lutData = CubeLutParser.parse(this@EditorActivity, filter.lutFileName)
-                withContext(Dispatchers.Main) {
-                    binding.progressBar.visibility = View.GONE
-                    if (lutData != null) {
-                        renderer.setCubeLut(lutData)
-                        binding.glSurfaceView.requestRender()
-                        if (saveState) saveCurrentState()
-                    } else {
-                        Toast.makeText(this@EditorActivity, "LUT 解析失败", Toast.LENGTH_SHORT).show()
-                    }
-                }
+                resetTouchAnchor = false
             }
         }
     }
