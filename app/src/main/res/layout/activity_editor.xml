@@ -31,6 +31,7 @@
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
+    <!-- 撤销/重做 -->
     <LinearLayout
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -219,7 +220,7 @@
             android:padding="16dp"
             android:visibility="gone">
 
-            <!-- [新增] 重置按钮 -->
+            <!-- 重置按钮 -->
             <Button
                 android:id="@+id/btnResetAdjust"
                 android:layout_width="wrap_content"

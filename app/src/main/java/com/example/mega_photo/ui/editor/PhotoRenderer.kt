@@ -29,26 +29,24 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var baseBitmap: Bitmap? = null
     private var baseTextureId: Int = 0
 
-    // LUT 3D 相关
     private var lut3DTextureId: Int = 0
     private var dummyLutTextureId: Int = 0
     private var hasLut: Boolean = false
     private var intensity: Float = 1.0f
 
+    // [核心修复] 初始化时补全 3 个参数
     private var currentFilterItem: FilterItem = FilterItem("Original", null, null)
 
     private var brightness: Float = 0.0f
     private var contrast: Float = 1.0f
     private var saturation: Float = 1.0f
 
-    // 变换状态
     private var currentScale = 1.0f
     private var currentX = 0f
     private var currentY = 0f
     private var currentRotation = 0f
     private var isFlipped = false
     private val mvpMatrix = FloatArray(16)
-
     private var tempScale = 1.0f
 
     private var currentCropRect = RectF(0f, 0f, 1f, 1f)
@@ -62,7 +60,6 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var imageHeight = 0
     private var viewWidth = 0
     private var viewHeight = 0
-
     private var lastModelScaleX = 1f
     private var lastModelScaleY = 1f
 
@@ -78,9 +75,7 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     fun setTempScale(scale: Float) {
-        runOnDraw.add(Runnable {
-            tempScale = scale
-        })
+        runOnDraw.add(Runnable { tempScale = scale })
     }
 
     fun setCubeLut(data: CubeLutData?) {
@@ -109,24 +104,13 @@ class PhotoRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     fun saveImage(callback: (Bitmap) -> Unit) {
-        runOnDraw.add(Runnable {
-            tempScale = 1.0f
-        })
+        runOnDraw.add(Runnable { tempScale = 1.0f })
         savePathCallback = callback
     }
 
-    // [核心修复] 极简变换更新：完全分离位移和缩放
-    // 缩放永远基于屏幕中心 (0,0) 进行
-    // 这样无论何时缩放，图片都是稳稳地变大变小，不会发生位移
     fun updateTransform(dx: Float, dy: Float, scaleFactor: Float) {
-        // 1. 更新缩放 (限制范围 0.5 - 10.0)
-        // 使用乘法累积缩放，实现相对缩放的效果
         currentScale *= scaleFactor
         currentScale = currentScale.coerceIn(0.5f, 10.0f)
-
-        // 2. 更新平移
-        // 这里的 dx, dy 是屏幕上的位移增量，直接累加
-        // 只有单指拖动时 dx/dy 才有值，双指缩放时 dx/dy 为 0
         currentX += dx
         currentY += dy
     }

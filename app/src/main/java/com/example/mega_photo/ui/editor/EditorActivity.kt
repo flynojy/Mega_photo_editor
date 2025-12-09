@@ -1,6 +1,8 @@
 package com.example.mega_photo.ui.editor
 
 import android.app.AlertDialog
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
@@ -8,9 +10,11 @@ import android.util.Log
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import android.widget.EditText
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -21,6 +25,7 @@ import com.example.mega_photo.utils.BitmapUtils
 import com.example.mega_photo.utils.CubeLutData
 import com.example.mega_photo.utils.CubeLutParser
 import com.example.mega_photo.utils.FileSaver
+import com.example.mega_photo.utils.LutUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -28,22 +33,28 @@ import java.util.concurrent.ConcurrentHashMap
 
 class EditorActivity : AppCompatActivity() {
 
+    private val TAG = "EditorActivity"
     private lateinit var binding: ActivityEditorBinding
     private lateinit var renderer: PhotoRenderer
     private lateinit var scaleGestureDetector: ScaleGestureDetector
 
     private val stateManager = StateManager(maxHistory = 10)
-
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     private var isScaling = false
     private var isCropMode = false
-
-    // [新增] 手指抬起标记
     private var resetTouchAnchor = false
 
-    // [新增] 内存缓存 (Level 1 Cache)
     private val lutCache = ConcurrentHashMap<String, CubeLutData>()
+
+    private val allFilters = mutableListOf<FilterItem>()
+    private lateinit var filterAdapter: FilterAdapter
+
+    private val pickLutLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            showLutNameDialog(uri)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -82,26 +93,181 @@ class EditorActivity : AppCompatActivity() {
         binding.btnSave.setOnClickListener { showSaveDialog() }
     }
 
-    private fun setupFilters() {
-        val filters = listOf(
-            FilterItem("Original", null, "lut_example/original.jpg"),
-            FilterItem("Koto", "luts/KOTO.cube", "lut_example/koto.jpg"),
-            FilterItem("Taipei", "luts/TAIPEI.cube", "lut_example/taipai.jpg"),
-            FilterItem("Greenland", "luts/GREENLAND.cube", "lut_example/greenland.jpg"),
-            FilterItem("Nightscape", "luts/NIGHTSCAPE.cube", "lut_example/nightscape.jpg"),
-            FilterItem("Holiday", "luts/HOLIDAY.cube", "lut_example/holiday.jpg"),
-            FilterItem("Tokyo", "luts/TOKYO METRO.cube", "lut_example/tokyo.jpg"),
-            FilterItem("Gaomei", "luts/GAOMEI.cube", "lut_example/gaomei.jpg"),
-            FilterItem("Blaze", "luts/BLAZE LT.cube", "lut_example/blaze.jpg")
-        )
+    private fun showLutNameDialog(uri: Uri) {
+        val input = EditText(this)
+        input.hint = "请输入滤镜名称 (例如: My Style)"
+        AlertDialog.Builder(this)
+            .setTitle("导入 LUT")
+            .setView(input)
+            .setPositiveButton("确定") { _, _ ->
+                val name = input.text.toString().trim()
+                if (name.isNotEmpty()) {
+                    importLut(uri, name)
+                } else {
+                    Toast.makeText(this, "名称不能为空", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
 
-        binding.rvFilters.layoutManager = LinearLayoutManager(this, LinearLayoutManager.HORIZONTAL, false)
-        binding.rvFilters.adapter = FilterAdapter(filters) { filter ->
-            applyFilter(filter)
+    private fun setupFilters() {
+        allFilters.clear()
+        allFilters.add(FilterItem("Original", null, "lut_example/original.jpg"))
+        allFilters.add(FilterItem("Koto", "luts/KOTO.cube", "lut_example/koto.jpg"))
+        allFilters.add(FilterItem("Taipei", "luts/TAIPEI.cube", "lut_example/taipai.jpg"))
+        allFilters.add(FilterItem("Greenland", "luts/GREENLAND.cube", "lut_example/greenland.jpg"))
+        allFilters.add(FilterItem("Nightscape", "luts/NIGHTSCAPE.cube", "lut_example/nightscape.jpg"))
+        allFilters.add(FilterItem("Holiday", "luts/HOLIDAY.cube", "lut_example/holiday.jpg"))
+        allFilters.add(FilterItem("Tokyo", "luts/TOKYO METRO.cube", "lut_example/tokyo.jpg"))
+        allFilters.add(FilterItem("Gaomei", "luts/GAOMEI.cube", "lut_example/gaomei.jpg"))
+        allFilters.add(FilterItem("Blaze", "luts/BLAZE LT.cube", "lut_example/blaze.jpg"))
+
+        val imported = LutUtils.getImportedLuts(this)
+        imported.forEach { (lutPath, previewPath) ->
+            val fileName = lutPath.substringAfterLast("/")
+            val name = fileName.replace(".cube", "")
+            allFilters.add(FilterItem(name, lutPath, previewPath))
         }
 
-        // [新增] 启动预加载 (在后台静默执行)
-        preloadAllFilters(filters)
+        binding.rvFilters.layoutManager = LinearLayoutManager(this, LinearLayoutManager.HORIZONTAL, false)
+        filterAdapter = FilterAdapter(
+            filters = allFilters,
+            onFilterClick = { filter ->
+                if (filter == null) {
+                    pickLutLauncher.launch(arrayOf("*/*"))
+                } else {
+                    applyFilter(filter)
+                }
+            },
+            onFilterLongClick = { filter ->
+                handleLongClick(filter)
+            }
+        )
+        binding.rvFilters.adapter = filterAdapter
+
+        preloadAllFilters(allFilters)
+    }
+
+    private fun handleLongClick(filter: FilterItem) {
+        val path = filter.lutFileName ?: return
+        val isImported = path.startsWith("/")
+
+        if (!isImported) {
+            Toast.makeText(this, "内置滤镜不可删除", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("删除滤镜")
+            .setMessage("确定要删除 \"${filter.name}\" 吗？")
+            .setPositiveButton("删除") { _, _ ->
+                deleteLut(filter)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    // [修改] 删除逻辑 (带动画)
+    private fun deleteLut(filter: FilterItem) {
+        val index = allFilters.indexOf(filter)
+        if (index == -1) return
+
+        // index + 1 因为 adapter 第0位是 add 按钮
+        val adapterPosition = index + 1
+        val view = binding.rvFilters.layoutManager?.findViewByPosition(adapterPosition)
+
+        if (view != null) {
+            view.animate()
+                .alpha(0f)
+                .scaleX(0.5f)
+                .scaleY(0.5f)
+                .setDuration(300)
+                .withEndAction {
+                    performDelete(filter, index)
+                    // 复原 View 状态供复用
+                    view.alpha = 1f
+                    view.scaleX = 1f
+                    view.scaleY = 1f
+                }
+                .start()
+        } else {
+            performDelete(filter, index)
+        }
+    }
+
+    private fun performDelete(filter: FilterItem, index: Int) {
+        val lutPath = filter.lutFileName ?: return
+        val previewPath = filter.previewFileName ?: return
+
+        if (LutUtils.deleteImportedLut(this, lutPath, previewPath)) {
+            lutCache.remove(lutPath)
+            allFilters.removeAt(index)
+            // 刷新列表
+            filterAdapter.notifyItemRemoved(index + 1) // +1 header
+            filterAdapter.notifyItemRangeChanged(index + 1, allFilters.size - index)
+
+            val currentState = renderer.getCurrentState()
+            if (currentState.filterItem.lutFileName == lutPath) {
+                applyFilter(allFilters[0])
+            }
+
+            Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "删除失败", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun importLut(uri: Uri, name: String) {
+        binding.progressBar.visibility = View.VISIBLE
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val safeName = name.replace("[^a-zA-Z0-9_\\u4e00-\\u9fa5]".toRegex(), "_")
+                val fileName = "$safeName.cube"
+                val lutFile = LutUtils.copyUriToInternalStorage(this@EditorActivity, uri, fileName)
+
+                if (lutFile != null) {
+                    val lutData = CubeLutParser.load(this@EditorActivity, lutFile.absolutePath)
+
+                    if (lutData != null) {
+                        var baseBitmap: Bitmap? = null
+                        try {
+                            val basePreviewStream = assets.open("lut_example/original.jpg")
+                            baseBitmap = BitmapFactory.decodeStream(basePreviewStream)
+                        } catch (e: Exception) {
+                            baseBitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
+                            baseBitmap.eraseColor(Color.LTGRAY)
+                        }
+
+                        val previewBitmap = LutUtils.applyLutToBitmapCpu(lutData, baseBitmap!!)
+                        val previewName = fileName.replace(".cube", ".jpg")
+                        val previewPath = LutUtils.saveBitmapToInternalStorage(this@EditorActivity, previewBitmap, previewName)
+
+                        if (previewPath != null) {
+                            val newItem = FilterItem(name, lutFile.absolutePath, previewPath)
+                            lutCache[lutFile.absolutePath] = lutData
+
+                            withContext(Dispatchers.Main) {
+                                allFilters.add(newItem)
+                                // [修改] 使用 notifyItemInserted 替代全量刷新，增加动画
+                                filterAdapter.notifyItemInserted(allFilters.size) // +1(header) -1(index) +1(new) = size
+                                binding.rvFilters.smoothScrollToPosition(allFilters.size)
+                                Toast.makeText(this@EditorActivity, "导入成功: $name", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Import error", e)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@EditorActivity, "导入出错", Toast.LENGTH_SHORT).show()
+                }
+            } finally {
+                withContext(Dispatchers.Main) {
+                    binding.progressBar.visibility = View.GONE
+                }
+            }
+        }
     }
 
     private fun preloadAllFilters(filters: List<FilterItem>) {
@@ -109,7 +275,6 @@ class EditorActivity : AppCompatActivity() {
             filters.forEach { item ->
                 val path = item.lutFileName
                 if (path != null && !lutCache.containsKey(path)) {
-                    // load 方法会自动处理二进制缓存
                     val data = CubeLutParser.load(this@EditorActivity, path)
                     if (data != null) {
                         lutCache[path] = data
@@ -118,47 +283,6 @@ class EditorActivity : AppCompatActivity() {
             }
         }
     }
-
-    private fun applyFilter(filter: FilterItem, saveState: Boolean = true) {
-        renderer.updateFilterRecord(filter)
-
-        if (filter.lutFileName == null) {
-            renderer.setCubeLut(null)
-            binding.glSurfaceView.requestRender()
-            if (saveState) saveCurrentState()
-        } else {
-            val fileName = filter.lutFileName
-
-            // 1. 查内存缓存
-            if (lutCache.containsKey(fileName)) {
-                renderer.setCubeLut(lutCache[fileName])
-                binding.glSurfaceView.requestRender()
-                if (saveState) saveCurrentState()
-            } else {
-                // 2. 内存未命中，异步加载 (会自动查磁盘缓存)
-                binding.progressBar.visibility = View.VISIBLE
-                lifecycleScope.launch(Dispatchers.IO) {
-                    val lutData = CubeLutParser.load(this@EditorActivity, fileName)
-                    if (lutData != null) {
-                        lutCache[fileName] = lutData
-                    }
-
-                    withContext(Dispatchers.Main) {
-                        binding.progressBar.visibility = View.GONE
-                        if (lutData != null) {
-                            renderer.setCubeLut(lutData)
-                            binding.glSurfaceView.requestRender()
-                            if (saveState) saveCurrentState()
-                        } else {
-                            Toast.makeText(this@EditorActivity, "LUT 解析失败", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // --- 以下方法保持原有逻辑，为完整性一并提供 ---
 
     private fun setupUndoRedo() {
         binding.btnUndo.setOnClickListener {
@@ -366,9 +490,44 @@ class EditorActivity : AppCompatActivity() {
                 lastTouchX = event.x
                 lastTouchY = event.y
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+            MotionEvent.ACTION_UP -> {
                 if (!isScaling) saveCurrentState()
                 resetTouchAnchor = false
+            }
+        }
+    }
+
+    private fun applyFilter(filter: FilterItem, saveState: Boolean = true) {
+        renderer.updateFilterRecord(filter)
+
+        if (filter.lutFileName == null) {
+            renderer.setCubeLut(null)
+            binding.glSurfaceView.requestRender()
+            if (saveState) saveCurrentState()
+        } else {
+            val fileName = filter.lutFileName
+            if (lutCache.containsKey(fileName)) {
+                renderer.setCubeLut(lutCache[fileName])
+                binding.glSurfaceView.requestRender()
+                if (saveState) saveCurrentState()
+            } else {
+                binding.progressBar.visibility = View.VISIBLE
+                lifecycleScope.launch(Dispatchers.IO) {
+                    val lutData = CubeLutParser.load(this@EditorActivity, fileName)
+                    if (lutData != null) {
+                        lutCache[fileName] = lutData
+                    }
+                    withContext(Dispatchers.Main) {
+                        binding.progressBar.visibility = View.GONE
+                        if (lutData != null) {
+                            renderer.setCubeLut(lutData)
+                            binding.glSurfaceView.requestRender()
+                            if (saveState) saveCurrentState()
+                        } else {
+                            Toast.makeText(this@EditorActivity, "LUT 解析失败", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
             }
         }
     }

@@ -21,26 +21,26 @@ object CubeLutParser {
 
     private const val TAG = "CubeLutParser"
 
-    /**
-     * 智能加载 LUT 数据 (对外唯一接口)
-     */
     fun load(context: Context, assetFileName: String): CubeLutData? {
-        // 生成缓存文件名，例如 "luts_KOTO.cube" -> "luts_KOTO.bin"
-        val cacheFileName = assetFileName.replace("/", "_").replace(".cube", ".bin")
+        // 兼容外部文件路径 (如果 path 包含 /storage 或 /data，说明是绝对路径，不是 assets)
+        val isAsset = !assetFileName.startsWith("/") && !assetFileName.startsWith("content://")
+
+        // 缓存文件名处理：如果是绝对路径，取文件名部分
+        val cacheKey = if (isAsset) assetFileName else File(assetFileName).name
+        val cacheFileName = cacheKey.replace("/", "_").replace(".cube", ".bin")
         val cacheFile = File(context.cacheDir, cacheFileName)
 
-        // 1. 尝试从二进制缓存加载 (极快)
         if (cacheFile.exists()) {
             val cachedData = loadFromBinaryCache(cacheFile)
-            if (cachedData != null) {
-                return cachedData
-            }
+            if (cachedData != null) return cachedData
         }
 
-        // 2. 缓存未命中，解析原始 Assets 文本文件 (较慢)
-        val parsedData = parseFromAssets(context, assetFileName)
+        val parsedData = if (isAsset) {
+            parseFromAssets(context, assetFileName)
+        } else {
+            parseFromFile(assetFileName)
+        }
 
-        // 3. 解析成功后，写入二进制缓存供下次使用
         if (parsedData != null) {
             saveToBinaryCache(cacheFile, parsedData)
         }
@@ -52,23 +52,17 @@ object CubeLutParser {
         try {
             FileInputStream(file).use { fis ->
                 val channel = fis.channel
-                // 内存映射文件，读取速度最快
+                if (channel.size() < 4) return null
                 val buffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size())
                 buffer.order(ByteOrder.nativeOrder())
-
-                // 读取头部 (Size)
                 val size = buffer.int
-
-                // 读取数据 (Float Array)
                 val floatBuffer = buffer.asFloatBuffer()
-                // slice() 是必须的，否则 buffer 位置可能会乱
                 val data = floatBuffer.slice()
-
                 return CubeLutData(size, data)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error loading cache", e)
-            file.delete() // 缓存损坏，删除之
+            file.delete()
             return null
         }
     }
@@ -77,17 +71,12 @@ object CubeLutParser {
         try {
             FileOutputStream(file).use { fos ->
                 val channel = fos.channel
-                // 计算文件大小: 4字节(Size) + 数据点数 * 4字节(Float)
                 val capacity = 4 + data.data.capacity() * 4
                 val buffer = ByteBuffer.allocate(capacity).order(ByteOrder.nativeOrder())
-
                 buffer.putInt(data.size)
-
-                // 必须将源 buffer 位置重置才能读取
                 data.data.position(0)
                 buffer.asFloatBuffer().put(data.data)
-                data.data.position(0) // 恢复位置供渲染器使用
-
+                data.data.position(0)
                 buffer.position(0)
                 channel.write(buffer)
             }
@@ -96,63 +85,108 @@ object CubeLutParser {
         }
     }
 
-    // 原始的文本解析逻辑
     private fun parseFromAssets(context: Context, assetFileName: String): CubeLutData? {
-        try {
+        return try {
             val inputStream = context.assets.open(assetFileName)
-            val reader = BufferedReader(InputStreamReader(inputStream))
+            parseStream(inputStream)
+        } catch (e: Exception) {
+            Log.e(TAG, "Asset parse error", e)
+            null
+        }
+    }
 
-            var size = -1
-            val dataPoints = mutableListOf<Float>()
+    private fun parseFromFile(filePath: String): CubeLutData? {
+        return try {
+            val inputStream = FileInputStream(filePath)
+            parseStream(inputStream)
+        } catch (e: Exception) {
+            Log.e(TAG, "File parse error", e)
+            null
+        }
+    }
 
+    // [核心修复] 通用解析逻辑，增强兼容性
+    private fun parseStream(inputStream: java.io.InputStream): CubeLutData? {
+        val reader = BufferedReader(InputStreamReader(inputStream))
+        var size = -1
+        val dataPoints = mutableListOf<Float>()
+
+        try {
             var line: String? = reader.readLine()
             while (line != null) {
                 line = line.trim()
+
+                // 跳过空行和注释
                 if (line.isEmpty() || line.startsWith("#")) {
                     line = reader.readLine()
                     continue
                 }
 
+                // 解析 TITLE (跳过)
+                if (line.startsWith("TITLE")) {
+                    line = reader.readLine()
+                    continue
+                }
+
+                // 解析尺寸
                 if (line.startsWith("LUT_3D_SIZE")) {
                     val parts = line.split("\\s+".toRegex())
                     if (parts.size >= 2) {
                         size = parts[1].toInt()
                     }
                 }
-                else if (size > 0 && line.isNotEmpty()) {
+                // 解析数据
+                else {
+                    // 检查行首字符是否可能是数字 (数字、负号、点)
                     val firstChar = line[0]
-                    // 简单的数字检查
-                    val isNumberStart = Character.isDigit(firstChar) || (firstChar == '-' && line.length > 1)
+                    val isPotentiallyNumber = Character.isDigit(firstChar) || firstChar == '-' || firstChar == '.'
 
-                    if (isNumberStart) {
+                    if (isPotentiallyNumber && size > 0) {
+                        // 使用正则分割，兼容空格和 Tab
                         val parts = line.split("\\s+".toRegex())
+                        // 有些行可能包含 3个数字，有些可能更多或更少，只要能凑齐 RGB 就行
+                        // 通常是 "R G B"
                         if (parts.size >= 3) {
-                            dataPoints.add(parts[0].toFloat())
-                            dataPoints.add(parts[1].toFloat())
-                            dataPoints.add(parts[2].toFloat())
+                            try {
+                                val r = parts[0].toFloat()
+                                val g = parts[1].toFloat()
+                                val b = parts[2].toFloat()
+                                dataPoints.add(r)
+                                dataPoints.add(g)
+                                dataPoints.add(b)
+                            } catch (e: NumberFormatException) {
+                                // 忽略解析失败的行 (可能是非数据行)
+                            }
                         }
                     }
                 }
                 line = reader.readLine()
             }
+        } finally {
             reader.close()
+        }
 
-            if (size == -1 || dataPoints.isEmpty()) return null
-
-            val buffer = ByteBuffer.allocateDirect(dataPoints.size * 4)
-                .order(ByteOrder.nativeOrder())
-                .asFloatBuffer()
-
-            for (f in dataPoints) {
-                buffer.put(f)
-            }
-            buffer.position(0)
-
-            return CubeLutData(size, buffer)
-
-        } catch (e: Exception) {
-            e.printStackTrace()
+        if (size == -1 || dataPoints.isEmpty()) {
+            Log.e(TAG, "Invalid CUBE file: size=$size, points=${dataPoints.size}")
             return null
         }
+
+        // 验证数据完整性 (size^3 * 3)
+        val expectedSize = size * size * size * 3
+        if (dataPoints.size != expectedSize) {
+            Log.w(TAG, "Data points mismatch! Expected: $expectedSize, Actual: ${dataPoints.size}. Attempting to use anyway.")
+            // 某些 LUT 可能不完整，但我们还是尝试转换
+        }
+
+        val buffer = ByteBuffer.allocateDirect(dataPoints.size * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+
+        for (f in dataPoints) {
+            buffer.put(f)
+        }
+        buffer.position(0)
+
+        return CubeLutData(size, buffer)
     }
 }

@@ -3,20 +3,31 @@ package com.example.mega_photo.ui.adapter
 import android.graphics.Color
 import android.view.LayoutInflater
 import android.view.ViewGroup
+import android.widget.ImageView
 import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
-import com.bumptech.glide.load.resource.bitmap.CenterCrop
-import com.bumptech.glide.load.resource.bitmap.RoundedCorners
-import com.bumptech.glide.request.RequestOptions
 import com.example.mega_photo.data.FilterItem
 import com.example.mega_photo.databinding.ItemFilterBinding
+import java.io.File
 
 class FilterAdapter(
-    private val filters: List<FilterItem>,
-    private val onFilterClick: (FilterItem) -> Unit
+    private var filters: List<FilterItem>,
+    private val onFilterClick: (FilterItem?) -> Unit,
+    // [新增] 长按回调
+    private val onFilterLongClick: (FilterItem) -> Unit
 ) : RecyclerView.Adapter<FilterAdapter.FilterViewHolder>() {
 
     private var selectedPosition = 0
+
+    fun updateData(newFilters: List<FilterItem>) {
+        filters = newFilters
+        notifyDataSetChanged()
+    }
+
+    // [新增] 用于删除时的局部刷新
+    fun notifyItemRemovedInternal(position: Int) {
+        notifyItemRemoved(position)
+    }
 
     inner class FilterViewHolder(val binding: ItemFilterBinding) : RecyclerView.ViewHolder(binding.root)
 
@@ -28,26 +39,32 @@ class FilterAdapter(
     }
 
     override fun onBindViewHolder(holder: FilterViewHolder, position: Int) {
-        val item = filters[position]
+        if (position == 0) {
+            bindAddButton(holder)
+            return
+        }
+
+        val realPosition = position - 1
+        val item = filters[realPosition]
+
         holder.binding.tvName.text = item.name
 
-        // [新增] 使用 Glide 加载 assets 图片
         if (item.previewFileName != null) {
-            val assetPath = "file:///android_asset/${item.previewFileName}"
-            Glide.with(holder.itemView)
-                .load(assetPath)
-                .into(holder.binding.ivPreview)
+            val path = item.previewFileName
+            if (path.startsWith("lut_example/")) {
+                Glide.with(holder.itemView).load("file:///android_asset/$path").into(holder.binding.ivPreview)
+            } else {
+                Glide.with(holder.itemView).load(File(path)).into(holder.binding.ivPreview)
+            }
         } else {
-            // 原图没有预览图的话，可以用一个默认图或者清除
             holder.binding.ivPreview.setImageDrawable(null)
             holder.binding.ivPreview.setBackgroundColor(Color.DKGRAY)
         }
 
-        // 选中状态处理
         if (position == selectedPosition) {
             holder.binding.tvName.setTextColor(Color.YELLOW)
-            holder.binding.vSelection.setBackgroundResource(android.R.drawable.dialog_frame) // 简单的高亮框，或者自定义 drawable
-            holder.binding.vSelection.alpha = 0.5f // 简单的选中效果
+            holder.binding.vSelection.setBackgroundResource(android.R.drawable.dialog_frame)
+            holder.binding.vSelection.alpha = 0.5f
         } else {
             holder.binding.tvName.setTextColor(Color.WHITE)
             holder.binding.vSelection.background = null
@@ -60,7 +77,28 @@ class FilterAdapter(
             notifyItemChanged(selectedPosition)
             onFilterClick(item)
         }
+
+        // [新增] 绑定长按事件
+        holder.itemView.setOnLongClickListener {
+            onFilterLongClick(item)
+            true // 返回 true 表示事件已消费
+        }
     }
 
-    override fun getItemCount() = filters.size
+    private fun bindAddButton(holder: FilterViewHolder) {
+        holder.binding.tvName.text = "导入"
+        holder.binding.tvName.setTextColor(Color.WHITE)
+        holder.binding.ivPreview.scaleType = ImageView.ScaleType.CENTER
+        holder.binding.ivPreview.setImageResource(android.R.drawable.ic_input_add)
+        holder.binding.ivPreview.setBackgroundColor(Color.parseColor("#333333"))
+        holder.binding.vSelection.background = null
+
+        holder.itemView.setOnClickListener {
+            onFilterClick(null)
+        }
+        // 添加按钮不需要长按事件
+        holder.itemView.setOnLongClickListener(null)
+    }
+
+    override fun getItemCount() = filters.size + 1
 }

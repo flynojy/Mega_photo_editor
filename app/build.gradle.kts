@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.mega_photo"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1.0" // 版本号
+        versionCode = 3
+        versionName = "1.2.0" // 版本号
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
